@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcpaint"
+version = "0.1.0"
+description = "A local, visual-first paint studio with an MCP interface"
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.8,<7", "mcp>=1.26,<2", "Pillow>=11,<13", "imageio-ffmpeg>=0.6,<0.7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.12,<1", "pyinstaller>=6,<7"]
+
+[project.scripts]
+mcpaint = "mcpaint.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]

@@ -1,0 +1,68 @@
+name: Windows release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example v0.1.0)
+        required: true
+        default: v0.1.0
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.23'
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv run --frozen ruff check src tests scripts
+      - run: uv run --frozen pytest -q
+      - name: Build portable Windows executables
+        run: uv run --frozen python -m PyInstaller --noconfirm MCPaint.spec
+      - name: Test packaged runtime including FFmpeg and Qt
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath './dist/MCPaint/MCPaint-MCP.exe' -ArgumentList '--self-test' -PassThru -Wait -RedirectStandardOutput smoke.stdout.txt -RedirectStandardError smoke.stderr.txt
+          Get-Content smoke.stdout.txt
+          Get-Content smoke.stderr.txt
+          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed: $($process.ExitCode)" }
+      - run: uv run --frozen python scripts/collect_notices.py
+      - run: uv run --frozen python scripts/package_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: |
+            dist/MCPaint-0.1.0-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.1.0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: release-assets
+      - name: Publish tested download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; the new build is available as an Actions artifact."
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" release-assets/* --target "$GITHUB_SHA" --title "MCPaint $RELEASE_TAG" --notes-file docs/release-notes.md
