@@ -277,6 +277,40 @@ def import_image(path: str, layer_id: str | None = None, x: int = 0, y: int = 0)
     return call("import_image", path=path, layer_id=layer_id, x=x, y=y)
 
 
+@mcp.tool(annotations=EDIT)
+def import_image_layer(
+    path: str,
+    name: str | None = None,
+    placement: Literal["back", "above"] = "back",
+    fit: Literal["contain", "original"] = "contain",
+    opacity: float = 0.5,
+    locked: bool = True,
+    select_imported: bool = False,
+    expected_revision: int | None = None,
+) -> CallToolResult:
+    """Import PNG/JPEG/WebP as a NEW independent layer and return its imported_layer_id + PNG.
+
+    Defaults suit tracing: root-level back layer, centered proportional fit, 50% opacity,
+    locked; keep the drawing layer selected. Selection does not crop the imported image.
+    Draw above it, then update_layer(imported_layer_id, visible=False) before final export.
+    For an ordinary image layer use placement='above', opacity=1, locked=False,
+    select_imported=True. fit='original' centers native pixels (outside canvas is cropped).
+    Max 4096px/16MB; JPEG EXIF orientation and PNG transparency are preserved. Image bytes
+    are embedded in the project, including undo/redo and timelapse. Return state + PNG.
+    """
+    return call(
+        "import_image_layer",
+        path=path,
+        name=name,
+        placement=placement,
+        fit=fit,
+        opacity=opacity,
+        locked=locked,
+        select_imported=select_imported,
+        expected_revision=expected_revision,
+    )
+
+
 @mcp.tool(annotations=READ)
 def sample_color(
     x: float,

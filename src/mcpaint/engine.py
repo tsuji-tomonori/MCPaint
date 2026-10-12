@@ -507,7 +507,7 @@ class Document:
     def payload(self):
         return {
             "format": "MCPaint",
-            "version": 2,
+            "version": 3,
             "width": self.width,
             "height": self.height,
             "background": self.background,
@@ -540,7 +540,7 @@ class Document:
             raise ValueError("プロジェクトは100MB以下にしてください")
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
-        if payload.get("format") != "MCPaint" or payload.get("version") not in (1, 2):
+        if payload.get("format") != "MCPaint" or payload.get("version") not in (1, 2, 3):
             raise ValueError("対応していないプロジェクト形式です")
         doc = cls(payload["width"], payload["height"], payload["background"], payload["base_id"])
         timeline = payload["timeline"]

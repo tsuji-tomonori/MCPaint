@@ -725,9 +725,17 @@ class PaintWindow(QMainWindow):
                 self.canvas.rotation = number(request["rotation"], -180, 180, "rotation")
             self.canvas.update()
         elif op in OPS:
-            if op == "import_image" and "data" not in request:
-                request = {**request, "data": ui_tools.canonical_image(request["path"])}
-            self.doc.execute(request)
+            if op in ("import_image", "import_image_layer") and "data" not in request:
+                path = request["path"]
+                loader = (
+                    ui_tools.image_data if op == "import_image_layer" else ui_tools.canonical_image
+                )
+                request = {**request, "data": loader(path)}
+                if op == "import_image_layer" and not request.get("name"):
+                    request["name"] = Path(path).stem
+            command = self.doc.execute(request)
+            if op == "import_image_layer":
+                extra["imported_layer_id"] = command["id"]
             self.changed()
         elif op != "screenshot":
             raise ValueError("未知の操作です")

@@ -56,6 +56,7 @@ OPS = {
     "duplicate_layer",
     "merge_down",
     "import_image",
+    "import_image_layer",
     "mesh_warp",
     "flatten_group",
 }
@@ -139,7 +140,7 @@ def normalize(doc, c):
     op = c["op"]
     if op not in OPS:
         raise ValueError("未知の操作です")
-    if op not in ("select_region", "selection_edit"):
+    if op not in ("select_region", "selection_edit", "import_image_layer"):
         layer = doc.layer(c.get("layer_id"))
         c["layer_id"] = layer.id
         if op in ("fill", "shape", "gradient", "transform", "filter", "import_image", "mesh_warp"):
@@ -305,7 +306,7 @@ def normalize(doc, c):
         ):
             raise ValueError("統合対象は通常合成・クリッピングなしにしてください")
         c["lower_id"] = lower.id
-    if op == "import_image":
+    if op in ("import_image", "import_image_layer"):
         c.pop("path", None)
         data = base64.b64decode(c["data"], validate=True)
         if len(data) > 16 * 1024 * 1024:
@@ -314,8 +315,39 @@ def normalize(doc, c):
             if max(im.size) > 4096:
                 raise ValueError("画像は4096px以下にしてください")
             im.load()
-        c["x"] = int(number(c.get("x", 0), -4096, 4096, "x"))
-        c["y"] = int(number(c.get("y", 0), -4096, 4096, "y"))
+        if op == "import_image":
+            c["x"] = int(number(c.get("x", 0), -4096, 4096, "x"))
+            c["y"] = int(number(c.get("y", 0), -4096, 4096, "y"))
+        else:
+            if len(doc.layers) >= 64:
+                raise ValueError("レイヤー数の上限は64です")
+            c["id"] = c.get("id") or uuid.uuid4().hex
+            if any(layer.id == c["id"] for layer in doc.layers):
+                raise ValueError("レイヤーIDが重複しています")
+            c["name"] = str(c.get("name") or "参考画像")[:100]
+            c["fit"] = c.get("fit", "contain")
+            c["placement"] = c.get("placement", "back")
+            if c["fit"] not in ("contain", "original"):
+                raise ValueError("fitはcontain/originalです")
+            if c["placement"] not in ("back", "above"):
+                raise ValueError("placementはback/aboveです")
+            c["opacity"] = number(c.get("opacity", 0.5), 0, 1, "opacity")
+            for key, default in (("locked", True), ("select_imported", False)):
+                c[key] = c.get(key, default)
+                if not isinstance(c[key], bool):
+                    raise ValueError(f"{key}は真偽値です")
+            c["previous_active_id"] = doc.layer(c.get("previous_active_id")).id
+            anchor = doc.layer(c.get("anchor_id") or c["previous_active_id"])
+            c["anchor_id"] = anchor.id
+            c["group_id"] = (
+                None
+                if c["placement"] == "back"
+                else anchor.id
+                if anchor.kind == "group"
+                else anchor.group_id
+            )
+            if c["group_id"]:
+                unlocked(doc, doc.layer(c["group_id"]))
     if op == "mesh_warp":
         c["columns"] = int(number(c.get("columns", 2), 1, 8, "columns"))
         c["rows"] = int(number(c.get("rows", 2), 1, 8, "rows"))
@@ -600,9 +632,38 @@ def restrict_edit(doc, layer, before, after):
 
 
 def apply(doc, c, progress=1.0):
-    from .engine import draw_stroke, transparent
+    from .engine import Layer, draw_stroke, transparent
 
     op = c["op"]
+    if op == "import_image_layer":
+        with Image.open(io.BytesIO(base64.b64decode(c["data"]))) as image:
+            source = qimage(ImageOps.exif_transpose(image))
+        if c["fit"] == "contain":
+            source = source.scaled(
+                doc.width,
+                doc.height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        image = transparent(doc.width, doc.height)
+        p = QPainter(image)
+        p.drawImage((doc.width - source.width()) // 2, (doc.height - source.height()) // 2, source)
+        p.end()
+        layer = Layer(
+            c["id"],
+            c["name"],
+            image,
+            locked=c["locked"],
+            opacity=c["opacity"],
+            group_id=c["group_id"],
+        )
+        index = 0
+        if c["placement"] == "above":
+            anchors = doc.descendants(c["anchor_id"]) | {c["anchor_id"]}
+            index = max(i for i, other in enumerate(doc.layers) if other.id in anchors) + 1
+        doc.layers.insert(index, layer)
+        doc.active_id = layer.id if c["select_imported"] else c["previous_active_id"]
+        return
     if op == "select_region":
         if c["kind"] == "wand":
             mask = flood_mask(doc, c)

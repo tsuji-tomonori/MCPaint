@@ -64,12 +64,19 @@ BLEND_LABELS = {
 }
 
 
-def canonical_image(path):
+def image_data(path):
     if Path(path).stat().st_size > 16 * 1024 * 1024:
         raise ValueError("画像は16MB以下にしてください")
-    with Image.open(path) as image:
+    data = Path(path).read_bytes()
+    with Image.open(io.BytesIO(data)) as image:
         if max(image.size) > 4096:
             raise ValueError("画像は4096px以下にしてください")
+        image.load()
+    return base64.b64encode(data).decode()
+
+
+def canonical_image(path):
+    with Image.open(io.BytesIO(base64.b64decode(image_data(path)))) as image:
         image = ImageOps.exif_transpose(image).convert("RGBA")
         output = io.BytesIO()
         image.save(output, "PNG")
@@ -211,7 +218,9 @@ def install(window, panel):
     layers.addAction("マスクを反転", lambda: window.mutate({"op": "mask", "action": "invert"}))
     layers.addAction("マスクを描画に適用", lambda: window.mutate({"op": "mask", "action": "apply"}))
     image_menu = window.menuBar().addMenu("画像")
-    image_menu.addAction("画像を選択レイヤーに読み込む", lambda: import_dialog(window))
+    image_menu.addAction("参考画像を背面に読み込む…", lambda: import_dialog(window, "reference"))
+    image_menu.addAction("画像を新しいレイヤーに読み込む…", lambda: import_dialog(window, "layer"))
+    image_menu.addAction("画像を選択レイヤーへ貼り付ける…", lambda: import_dialog(window, "paste"))
     image_menu.addAction("選択範囲・レイヤーを変形", lambda: transform_dialog(window))
     image_menu.addAction("フィルター・色調整", lambda: filter_dialog(window))
     image_menu.addAction("選択範囲を囲って閉領域だけ塗る", lambda: enclose_selection(window))
@@ -605,13 +614,22 @@ def adjustment_dialog(window, edit=False):
         )
 
 
-def import_dialog(window):
+def import_dialog(window, mode="reference"):
     path, _ = QFileDialog.getOpenFileName(
         window, "画像を読み込む", "", "Images (*.png *.jpg *.jpeg *.webp)"
     )
     if path:
         try:
-            window.mutate({"op": "import_image", "data": canonical_image(path)})
+            command = {
+                "op": "import_image_layer",
+                "data": image_data(path),
+                "name": Path(path).stem,
+            }
+            if mode == "paste":
+                command = {"op": "import_image", "data": canonical_image(path)}
+            elif mode == "layer":
+                command.update(placement="above", opacity=1, locked=False, select_imported=True)
+            window.mutate(command)
         except Exception as e:
             QMessageBox.warning(window, "読み込み失敗", str(e))
 

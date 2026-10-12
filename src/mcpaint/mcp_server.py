@@ -31,6 +31,9 @@ and per-point t_ms to preserve stroke motion. Never assume an image before exami
 All strokes, layer edits, undo and redo are automatically journaled. Save a .mcpaint project to
 preserve editable layers and history; export PNG for artwork and MP4/GIF for timelapse.
 Illustration workflow: keep sketch, line art, flats, shadows and highlights on separate layers.
+Use import_image_layer for tracing references: it adds a fitted locked back layer and keeps
+your drawing layer selected. Use imported_layer_id to change opacity or hide the reference
+with update_layer(visible=False) before exporting the final PNG or timelapse.
 Fill flats using reference='layer' and the line-art reference_layer_id. Select/invert the outside
 to create a silhouette base, then clip a color folder and shading layers to it. Use multiply
 for shadows, screen/add for light, alpha_lock for recoloring, and layer masks for soft erasure.

@@ -1,4 +1,4 @@
-"""A real visual feedback loop through all 33 public MCP tools, not direct engine calls."""
+"""A real visual feedback loop through all 34 public MCP tools, not direct engine calls."""
 
 import asyncio
 import base64
@@ -153,6 +153,22 @@ def test_entire_illustration_workflow_over_stdio(tmp_path):
                     await call("undo")
                     await call("redo")
                     await call("delete_layer", layer_id=temp)
+                    reference_path = tmp_path / "reference.jpg"
+                    Image.new("RGB", (80, 60), "#cc6699").save(reference_path)
+                    state, _ = await call("import_image_layer", path=str(reference_path))
+                    reference_id = state["imported_layer_id"]
+                    assert state["state"]["active_layer"] != reference_id
+                    assert state["state"]["layers"][0]["id"] == reference_id
+                    await call("add_layer", name="トレース線画")
+                    await call(
+                        "draw_stroke",
+                        points=[{"x": 10, "y": 10}, {"x": 25, "y": 10}],
+                        color="#112233",
+                        size=3,
+                    )
+                    _, image = await call("update_layer", layer_id=reference_id, visible=False)
+                    assert image.getpixel((15, 10))[:3] == (17, 34, 51)
+                    reference_path.unlink()
                     project = tmp_path / "illustration.mcpaint"
                     await call("save_project", path=str(project))
                     final = Document.load(project).composite()

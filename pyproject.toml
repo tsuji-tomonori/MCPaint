@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcpaint"
-version = "0.2.0"
+version = "0.3.0"
 description = "A local, visual-first paint studio with an MCP interface"
 requires-python = ">=3.11"
 dependencies = ["PySide6-Essentials>=6.8,<7", "mcp>=1.26,<2", "Pillow>=11,<13", "imageio-ffmpeg>=0.6,<0.7", "numpy>=2.2,<3"]

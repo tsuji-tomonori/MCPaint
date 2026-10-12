@@ -57,7 +57,7 @@ def run():
         assert Document.load(extended).composite() == window.doc.composite()
         import asyncio
 
-        assert len(asyncio.run(mcp.list_tools())) == 33
+        assert len(asyncio.run(mcp.list_tools())) == 34
         window.close()
     print(
         json.dumps(
