@@ -15,6 +15,11 @@ jobs:
       QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v4
+      - name: Install Qt offscreen dependencies on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libgl1
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.23'
