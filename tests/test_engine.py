@@ -28,7 +28,10 @@ def test_brushes_roundtrip_and_timelapse(brush, tmp_path):
     doc = Document(64, 64)
     stroke(doc, size=20)
     before = png_bytes(doc.composite())
-    stroke(doc, brush=brush, color="#0000ff", size=8)
+    if brush in ("blur", "smudge"):
+        stroke(doc, brush=brush, size=30, points=[{"x": 5, "y": 32}, {"x": 63, "y": 32}])
+    else:
+        stroke(doc, brush=brush, color="#0000ff", size=8)
     if brush == "eraser":
         assert doc.layer().image.pixelColor(32, 32).alpha() == 0
     else:

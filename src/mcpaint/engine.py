@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import random
 import tempfile
 import time
 import uuid
@@ -15,7 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QRadialGradient
 
-BRUSHES = ("pen", "pencil", "marker", "airbrush", "eraser")
+BRUSHES = ("pen", "pencil", "marker", "airbrush", "eraser", "watercolor", "spray", "blur", "smudge")
 MAX_POINTS = 20000
 
 
@@ -58,6 +59,14 @@ class Layer:
     visible: bool = True
     locked: bool = False
     opacity: float = 1.0
+    kind: str = "paint"
+    group_id: str | None = None
+    blend_mode: str = "normal"
+    clipping: bool = False
+    alpha_lock: bool = False
+    mask: object = None
+    layer_color: str | None = None
+    adjustment: dict | None = None
 
 
 def draw_stroke(image: QImage, stroke: dict, progress: float = 1.0):
@@ -77,11 +86,69 @@ def draw_stroke(image: QImage, stroke: dict, progress: float = 1.0):
     brush = stroke["brush"]
     width = stroke["size"]
     c = QColor(stroke["color"])
+    if brush in ("blur", "smudge"):
+        from PIL import Image, ImageDraw, ImageStat
+
+        from .operations import filter_image, pil, qimage
+
+        source = pil(image)
+        if brush == "blur":
+            mask = transparent(image.width(), image.height())
+            draw_stroke(mask, {**stroke, "brush": "airbrush", "color": "#ffffff"}, progress)
+            blurred = pil(filter_image(image, {"kind": "blur", "radius": max(0.5, width * 0.2)}))
+            image.swap(qimage(Image.composite(blurred, source, pil(mask).getchannel("A"))))
+        else:
+            carry = None
+            for a, b in list(zip(points, points[1:], strict=False)) or [(points[0], points[0])]:
+                steps = max(
+                    1, math.ceil(math.hypot(b["x"] - a["x"], b["y"] - a["y"]) / max(1, width / 5))
+                )
+                for j in range(steps + 1):
+                    t = j / steps
+                    x, y = (
+                        round(a["x"] + (b["x"] - a["x"]) * t),
+                        round(a["y"] + (b["y"] - a["y"]) * t),
+                    )
+                    sample = tuple(
+                        round(v)
+                        for v in ImageStat.Stat(
+                            source.crop(
+                                (
+                                    max(0, x - 1),
+                                    max(0, y - 1),
+                                    min(source.width, x + 2),
+                                    min(source.height, y + 2),
+                                )
+                            )
+                        ).mean
+                    )
+                    carry = (
+                        sample
+                        if carry is None
+                        else tuple(
+                            round(u * 0.75 + v * 0.25) for u, v in zip(carry, sample, strict=True)
+                        )
+                    )
+                    radius = max(
+                        1, width * (a["pressure"] + (b["pressure"] - a["pressure"]) * t) / 2
+                    )
+                    stamp = Image.new("L", source.size)
+                    ImageDraw.Draw(stamp).ellipse(
+                        (x - radius, y - radius, x + radius, y + radius),
+                        fill=round(128 * stroke["opacity"]),
+                    )
+                    if carry[3]:
+                        source = Image.composite(
+                            Image.new("RGBA", source.size, carry), source, stamp
+                        )
+            image.swap(qimage(source))
+        return
     # Draw a stroke on its own surface to keep marker opacity independent of sample density.
     target = transparent(image.width(), image.height())
     p = QPainter(target)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    if brush == "airbrush":
+    if brush in ("airbrush", "watercolor", "spray"):
+        rng = random.Random(stroke.get("seed", 0))
         pairs = list(zip(points, points[1:], strict=False)) or [(points[0], points[0])]
         for a, b in pairs:
             distance = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
@@ -90,9 +157,22 @@ def draw_stroke(image: QImage, stroke: dict, progress: float = 1.0):
                 t = j / count
                 x, y = a["x"] + (b["x"] - a["x"]) * t, a["y"] + (b["y"] - a["y"]) * t
                 radius = width * max(0.1, a["pressure"] + (b["pressure"] - a["pressure"]) * t) / 2
+                if brush == "spray":
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(c)
+                    for _ in range(12):
+                        angle = rng.random() * math.tau
+                        distance = math.sqrt(rng.random()) * radius
+                        dot = max(0.5, width * 0.018 * rng.uniform(0.5, 1.5))
+                        p.drawEllipse(
+                            QPointF(x + math.cos(angle) * distance, y + math.sin(angle) * distance),
+                            dot,
+                            dot,
+                        )
+                    continue
                 gradient = QRadialGradient(QPointF(x, y), radius)
                 center = QColor(c)
-                center.setAlpha(100)
+                center.setAlpha(70 if brush == "watercolor" else 100)
                 edge = QColor(c)
                 edge.setAlpha(0)
                 gradient.setColorAt(0, center)
@@ -152,6 +232,7 @@ class Document:
     def _reset_layers(self):
         self.layers = [Layer(self.base_id, "レイヤー 1", transparent(self.width, self.height))]
         self.active_id = self.base_id
+        self.selection = None
 
     def layer(self, layer_id=None):
         for layer in self.layers:
@@ -160,17 +241,24 @@ class Document:
         raise ValueError("レイヤーが見つかりません")
 
     def normalize(self, command):
+        from .operations import BLEND_MODES, OPS, drawable, normalize_filter, unlocked
+
         c = copy.deepcopy(command)
         op = c.get("op")
+        if op in OPS:
+            from .operations import normalize
+
+            return normalize(self, c)
         if op == "stroke":
             c["layer_id"] = self.layer(c.get("layer_id")).id
-            if self.layer(c["layer_id"]).locked:
-                raise ValueError("レイヤーはロックされています")
+            drawable(self, self.layer(c["layer_id"]))
             if c.get("brush") not in BRUSHES:
                 raise ValueError(f"brush は {BRUSHES} から選択してください")
             c["color"] = color(c.get("color", "#24334a"))
             c["size"] = number(c.get("size", 4), 0.5, 300, "size")
             c["opacity"] = number(c.get("opacity", 1), 0, 1, "opacity")
+            c["smoothing"] = number(c.get("smoothing", 0), 0, 1, "smoothing")
+            c["seed"] = int(number(c.get("seed", 0), 0, 2**32 - 1, "seed"))
             points = c.get("points")
             if not isinstance(points, list) or not 1 <= len(points) <= MAX_POINTS:
                 raise ValueError(f"点数は 1..{MAX_POINTS} です")
@@ -196,25 +284,70 @@ class Document:
             if any(layer.id == c["id"] for layer in self.layers):
                 raise ValueError("レイヤーIDが重複しています")
             c["name"] = str(c.get("name", f"レイヤー {len(self.layers) + 1}"))[:100]
+            c["kind"] = c.get("kind", "paint")
+            if c["kind"] not in ("paint", "group", "adjustment"):
+                raise ValueError("レイヤー種別が不正です")
+            c["group_id"] = c.get("group_id")
+            if c["group_id"]:
+                parent = self.layer(c["group_id"])
+                unlocked(self, parent)
+                if parent.kind != "group":
+                    raise ValueError("親はフォルダーを指定してください")
+            if c["kind"] == "adjustment":
+                c["adjustment"] = normalize_filter(
+                    c.get("adjustment", {"kind": "brightness_contrast"})
+                )
         elif op in ("update_layer", "delete_layer", "move_layer", "clear_layer"):
             c["layer_id"] = self.layer(c.get("layer_id")).id
             if op == "update_layer":
                 c["changes"] = {
                     k: v
                     for k, v in c.get("changes", {}).items()
-                    if k in ("name", "visible", "locked", "opacity")
+                    if k
+                    in (
+                        "name",
+                        "visible",
+                        "locked",
+                        "opacity",
+                        "blend_mode",
+                        "clipping",
+                        "alpha_lock",
+                        "group_id",
+                        "layer_color",
+                        "adjustment",
+                    )
                 }
                 if "opacity" in c["changes"]:
                     c["changes"]["opacity"] = number(c["changes"]["opacity"], 0, 1, "opacity")
-                for key in ("visible", "locked"):
+                for key in ("visible", "locked", "clipping", "alpha_lock"):
                     if key in c["changes"] and not isinstance(c["changes"][key], bool):
                         raise ValueError(f"{key} は真偽値です")
                 if "name" in c["changes"]:
                     c["changes"]["name"] = str(c["changes"]["name"])[:100]
-            if op == "delete_layer" and len(self.layers) == 1:
-                raise ValueError("最後のレイヤーは削除できません")
-            if op == "clear_layer" and self.layer(c["layer_id"]).locked:
-                raise ValueError("レイヤーはロックされています")
+                changes = c["changes"]
+                if changes.get("blend_mode", "normal") not in BLEND_MODES:
+                    raise ValueError("無効な合成モードです")
+                if "layer_color" in changes and changes["layer_color"]:
+                    changes["layer_color"] = color(changes["layer_color"])
+                if "adjustment" in changes:
+                    if self.layer(c["layer_id"]).kind != "adjustment":
+                        raise ValueError("補正レイヤーを指定してください")
+                    changes["adjustment"] = normalize_filter(changes["adjustment"])
+                if "group_id" in changes and changes["group_id"]:
+                    parent = self.layer(changes["group_id"])
+                    if parent.kind != "group":
+                        raise ValueError("親はフォルダーを指定してください")
+                    while parent:
+                        if parent.id == c["layer_id"]:
+                            raise ValueError("フォルダーを循環させることはできません")
+                        parent = self.layer(parent.group_id) if parent.group_id else None
+            if op == "delete_layer":
+                unlocked(self, self.layer(c["layer_id"]))
+                removed = self.descendants(c["layer_id"]) | {c["layer_id"]}
+                if not any(x.kind == "paint" and x.id not in removed for x in self.layers):
+                    raise ValueError("最後の描画レイヤーは削除できません")
+            if op == "clear_layer":
+                drawable(self, self.layer(c["layer_id"]))
             if op == "move_layer":
                 c["index"] = int(number(c["index"], 0, len(self.layers) - 1, "index"))
         else:
@@ -222,20 +355,53 @@ class Document:
         return c
 
     def _apply(self, c, progress=1.0):
+        from .operations import OPS, apply, restrict_edit
+
         op = c["op"]
-        if op == "stroke":
-            draw_stroke(self.layer(c["layer_id"]).image, c, progress)
+        if op in OPS:
+            apply(self, c, progress)
+        elif op == "stroke":
+            layer = self.layer(c["layer_id"])
+            before = layer.image.copy()
+            points = c["points"]
+            if c.get("smoothing") and len(points) > 2:
+                amount = c["smoothing"] * 0.45
+                pts = (
+                    [points[0]]
+                    + [
+                        dict(
+                            b,
+                            x=b["x"] * (1 - amount) + (a["x"] + d["x"]) * amount / 2,
+                            y=b["y"] * (1 - amount) + (a["y"] + d["y"]) * amount / 2,
+                        )
+                        for a, b, d in zip(points, points[1:], points[2:], strict=False)
+                    ]
+                    + [points[-1]]
+                )
+                c = {**c, "points": pts}
+            draw_stroke(layer.image, c, progress)
+            restrict_edit(self, layer, before, layer.image)
         elif op == "add_layer":
-            self.layers.append(Layer(c["id"], c["name"], transparent(self.width, self.height)))
+            self.layers.append(
+                Layer(
+                    c["id"],
+                    c["name"],
+                    transparent(self.width, self.height),
+                    kind=c.get("kind", "paint"),
+                    group_id=c.get("group_id"),
+                    adjustment=c.get("adjustment"),
+                )
+            )
             self.active_id = c["id"]
         elif op == "update_layer":
             layer = self.layer(c["layer_id"])
             for key, value in c["changes"].items():
                 setattr(layer, key, value)
         elif op == "delete_layer":
-            self.layers.remove(self.layer(c["layer_id"]))
-            if self.active_id == c["layer_id"]:
-                self.active_id = self.layers[-1].id
+            removed = self.descendants(c["layer_id"]) | {c["layer_id"]}
+            self.layers = [x for x in self.layers if x.id not in removed]
+            if self.active_id in removed:
+                self.active_id = next(x.id for x in reversed(self.layers) if x.kind == "paint")
         elif op == "move_layer":
             layer = self.layer(c["layer_id"])
             self.layers.remove(layer)
@@ -292,16 +458,15 @@ class Document:
             self.active_id = active
 
     def composite(self, background=True):
-        image = transparent(self.width, self.height)
-        if background:
-            image.fill(QColor(self.background))
-        p = QPainter(image)
-        for layer in self.layers:
-            if layer.visible:
-                p.setOpacity(layer.opacity)
-                p.drawImage(0, 0, layer.image)
-        p.end()
-        return image
+        from .operations import composite_layers
+
+        return composite_layers(self, background=background)
+
+    def descendants(self, layer_id):
+        children = {x.id for x in self.layers if x.group_id == layer_id}
+        for child in list(children):
+            children |= self.descendants(child)
+        return children
 
     def state(self):
         return {
@@ -314,6 +479,10 @@ class Document:
             "can_undo": self.cursor > 0,
             "can_redo": self.cursor < len(self.history),
             "recorded_events": len(self.timeline),
+            "selection": {
+                "active": self.selection is not None,
+                "bounds": self.selection.getbbox() if self.selection is not None else None,
+            },
             "layers": [
                 {
                     "id": x.id,
@@ -322,6 +491,14 @@ class Document:
                     "locked": x.locked,
                     "opacity": x.opacity,
                     "index": i,
+                    "kind": x.kind,
+                    "group_id": x.group_id,
+                    "blend_mode": x.blend_mode,
+                    "clipping": x.clipping,
+                    "alpha_lock": x.alpha_lock,
+                    "has_mask": x.mask is not None,
+                    "layer_color": x.layer_color,
+                    "adjustment": x.adjustment,
                 }
                 for i, x in enumerate(self.layers)
             ],
@@ -330,7 +507,7 @@ class Document:
     def payload(self):
         return {
             "format": "MCPaint",
-            "version": 1,
+            "version": 2,
             "width": self.width,
             "height": self.height,
             "background": self.background,
@@ -363,7 +540,7 @@ class Document:
             raise ValueError("プロジェクトは100MB以下にしてください")
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
-        if payload.get("format") != "MCPaint" or payload.get("version") != 1:
+        if payload.get("format") != "MCPaint" or payload.get("version") not in (1, 2):
             raise ValueError("対応していないプロジェクト形式です")
         doc = cls(payload["width"], payload["height"], payload["background"], payload["base_id"])
         timeline = payload["timeline"]

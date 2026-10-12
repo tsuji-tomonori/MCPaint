@@ -44,12 +44,14 @@ class Bridge:
                     return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 4 * 1024 * 1024:
+                    if not 0 < size <= 32 * 1024 * 1024:
                         self.send_error(413)
                         return
                     payload = json.loads(self.rfile.read(size))
                     if payload.get("op") == "ping":
-                        result = {"ok": True, "name": "MCPaint"}
+                        from . import __version__
+
+                        result = {"ok": True, "name": "MCPaint", "version": __version__}
                     else:
                         job = Job(payload)
                         bridge.queue.put_nowait(job)

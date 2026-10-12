@@ -40,7 +40,7 @@ def test_real_stdio_mcp_to_desktop_and_authentication(tmp_path):
                         "export_timelapse",
                         "update_layer",
                     } <= names
-                    assert len(names) == 16
+                    assert len(names) == 33
                     result = await session.call_tool("new_canvas", {"width": 160, "height": 100})
                     assert not result.isError
                     state = json.loads(result.content[0].text)["state"]

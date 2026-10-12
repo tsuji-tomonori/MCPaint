@@ -18,6 +18,10 @@ from pydantic import BaseModel, Field
 
 from .bridge import data_dir
 
+Brush = Literal[
+    "pen", "pencil", "marker", "airbrush", "eraser", "watercolor", "spray", "blur", "smudge"
+]
+
 INSTRUCTIONS = """MCPaint is a local Windows paint studio. Work visually: call screenshot first,
 inspect it, choose a layer and brush, draw a small group of strokes, then inspect returned images.
 Coordinates always use ORIGINAL canvas pixels (top-left origin, x right, y down), not scaled
@@ -26,6 +30,13 @@ drawing plan. Each mutation returns state + PNG. Use points to express the actua
 and per-point t_ms to preserve stroke motion. Never assume an image before examining it.
 All strokes, layer edits, undo and redo are automatically journaled. Save a .mcpaint project to
 preserve editable layers and history; export PNG for artwork and MP4/GIF for timelapse.
+Illustration workflow: keep sketch, line art, flats, shadows and highlights on separate layers.
+Fill flats using reference='layer' and the line-art reference_layer_id. Select/invert the outside
+to create a silhouette base, then clip a color folder and shading layers to it. Use multiply
+for shadows, screen/add for light, alpha_lock for recoloring, and layer masks for soft erasure.
+Use nondestructive adjustment layers for tone curves, color balance and gradient maps.
+Inspect selection/mask/layer PNGs before applying transforms or detailed edits. All tools use
+the same journal and desktop rendering; no image generation service is required.
 """
 
 mcp = FastMCP("MCPaint", instructions=INSTRUCTIONS)
@@ -67,6 +78,13 @@ def existing_session():
 
 def ensure_app():
     if existing_session():
+        from . import __version__
+
+        version = request({"op": "ping"}, timeout=1).get("version", "0.1.0")
+        if version != __version__:
+            raise RuntimeError(
+                f"起動中のMCPaintは{version}です。終了して{__version__}のMCPaint.exeを起動してください"
+            )
         return
     if getattr(sys, "frozen", False):
         command = [str(Path(sys.executable).with_name("MCPaint.exe"))]
@@ -110,13 +128,23 @@ def call(op, **args):
 
 @mcp.tool(annotations=READ)
 def screenshot(
-    scope: Literal["canvas", "window"] = "canvas",
+    scope: Literal["canvas", "window", "layer", "selection", "mask"] = "canvas",
     grid: bool = False,
     crop: list[int] | None = None,
     max_size: int = 1280,
+    layer_id: str | None = None,
+    selection_overlay: bool = True,
 ) -> CallToolResult:
     """Return current PNG, layers, brush, revision and pixel coordinate mapping. crop=[x,y,w,h]."""
-    return call("screenshot", scope=scope, grid=grid, crop=crop, max_size=max_size)
+    return call(
+        "screenshot",
+        scope=scope,
+        grid=grid,
+        crop=crop,
+        max_size=max_size,
+        layer_id=layer_id,
+        selection_overlay=selection_overlay,
+    )
 
 
 @mcp.tool(annotations=EDIT)
@@ -127,24 +155,29 @@ def new_canvas(width: int = 1280, height: int = 800, background: str = "#ffffff"
 
 @mcp.tool(annotations=EDIT)
 def set_brush(
-    brush: Literal["pen", "pencil", "marker", "airbrush", "eraser"] | None = None,
+    brush: Brush | None = None,
     color: str | None = None,
     size: float | None = None,
     opacity: float | None = None,
+    smoothing: float | None = None,
 ) -> CallToolResult:
     """Choose brush, #RRGGBB color, width 0.5..300 px and opacity 0..1. Return screen."""
-    return call("set_brush", brush=brush, color=color, size=size, opacity=opacity)
+    return call(
+        "set_brush", brush=brush, color=color, size=size, opacity=opacity, smoothing=smoothing
+    )
 
 
 @mcp.tool(annotations=EDIT)
 def draw_stroke(
     points: list[StrokePoint],
     layer_id: str | None = None,
-    brush: Literal["pen", "pencil", "marker", "airbrush", "eraser"] | None = None,
+    brush: Brush | None = None,
     color: str | None = None,
     size: float | None = None,
     opacity: float | None = None,
     expected_revision: int | None = None,
+    smoothing: float | None = None,
+    seed: int = 0,
 ) -> CallToolResult:
     """Draw a path of 1..20000 ordered points in original canvas pixels. Optional pressure/t_ms.
 
@@ -160,13 +193,21 @@ def draw_stroke(
         size=size,
         opacity=opacity,
         expected_revision=expected_revision,
+        smoothing=smoothing,
+        seed=seed,
     )
 
 
 @mcp.tool(annotations=EDIT)
-def add_layer(name: str = "新しいレイヤー") -> CallToolResult:
-    """Add and select a transparent layer above the stack (maximum 64)."""
-    return call("add_layer", name=name)
+def add_layer(
+    name: str = "新しいレイヤー",
+    kind: Literal["paint", "group"] = "paint",
+    group_id: str | None = None,
+) -> CallToolResult:
+    """Add and select a paint layer or folder (maximum 64); group_id puts it inside a folder.
+    Paint flats inside a clipped color folder before adding multiply shadows in that folder.
+    """
+    return call("add_layer", name=name, kind=kind, group_id=group_id)
 
 
 @mcp.tool(annotations=EDIT)
@@ -182,13 +223,54 @@ def update_layer(
     visible: bool | None = None,
     locked: bool | None = None,
     opacity: float | None = None,
+    blend_mode: Literal[
+        "normal",
+        "multiply",
+        "screen",
+        "overlay",
+        "soft_light",
+        "hard_light",
+        "add",
+        "darken",
+        "lighten",
+        "color_dodge",
+        "color_burn",
+        "linear_burn",
+        "difference",
+    ]
+    | None = None,
+    clipping: bool | None = None,
+    alpha_lock: bool | None = None,
+    group_id: str | None = None,
+    ungroup: bool = False,
+    layer_color: str | None = None,
+    clear_layer_color: bool = False,
+    adjustment: dict | None = None,
 ) -> CallToolResult:
-    """Change layer name, visibility, lock or opacity (0..1); return screen."""
+    """Edit layer/folder name, visibility, lock, opacity, blend mode, clipping, alpha lock,
+    parent folder, display line color, or correction settings. Clipping uses the nearest
+    non-clipping sibling below. ungroup/clear_layer_color remove those settings. Return PNG.
+    """
     changes = {
         k: v
-        for k, v in {"name": name, "visible": visible, "locked": locked, "opacity": opacity}.items()
+        for k, v in {
+            "name": name,
+            "visible": visible,
+            "locked": locked,
+            "opacity": opacity,
+            "blend_mode": blend_mode,
+            "clipping": clipping,
+            "alpha_lock": alpha_lock,
+            "group_id": group_id,
+            "layer_color": layer_color,
+            "adjustment": adjustment,
+        }.items()
         if v is not None
     }
+    if ungroup:
+        changes["group_id"] = None
+    if clear_layer_color:
+        changes["layer_color"] = None
     return call("update_layer", layer_id=layer_id, changes=changes)
 
 
@@ -259,3 +341,6 @@ def visual_painting():
 
 def run_mcp():
     mcp.run(transport="stdio")
+
+
+from . import mcp_tools  # noqa: E402,F401

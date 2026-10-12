@@ -6,14 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (for example v0.1.0)
+        description: Release tag matching the package version
         required: true
-        default: v0.1.0
+        default: v0.2.0
 permissions:
   contents: read
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -24,10 +26,16 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --frozen --extra dev
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = uv run --frozen python -c "from mcpaint import __version__; print(__version__)"
+          "tag=v$version" >> $env:GITHUB_OUTPUT
       - run: uv run --frozen ruff check src tests scripts
       - run: uv run --frozen pytest -q
       - name: Build portable Windows executables
-        run: uv run --frozen python -m PyInstaller --noconfirm MCPaint.spec
+        run: uv run --frozen python -m PyInstaller --clean --noconfirm MCPaint.spec
       - name: Test packaged runtime including FFmpeg and Qt
         shell: pwsh
         run: |
@@ -35,13 +43,15 @@ jobs:
           Get-Content smoke.stdout.txt
           Get-Content smoke.stderr.txt
           if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed: $($process.ExitCode)" }
+      - name: Test packaged GUI through the real MCP protocol
+        run: uv run --frozen python scripts/test_packaged_mcp.py
       - run: uv run --frozen python scripts/collect_notices.py
       - run: uv run --frozen python scripts/package_release.py
       - uses: actions/upload-artifact@v4
         with:
           name: windows-portable
           path: |
-            dist/MCPaint-0.1.0-windows-x64.zip
+            dist/MCPaint-*-windows-x64.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
   publish:
@@ -50,7 +60,7 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.1.0' }}
+      RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || needs.build.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

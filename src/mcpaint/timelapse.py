@@ -17,7 +17,9 @@ def replay_frames(doc, max_frames=240, max_size=800):
     for event in events:
         c = event.get("command", {})
         weights.append(
-            max(150, min(2500, c["points"][-1]["t_ms"])) if c.get("op") == "stroke" else 150
+            max(150, min(2500, c["points"][-1]["t_ms"]))
+            if c.get("op") in ("stroke", "mask_stroke")
+            else 150
         )
     total = sum(weights) or 1
     # Allocate samples over a compact playback timeline. Every sampled frame reconstructs
@@ -41,13 +43,15 @@ def replay_frames(doc, max_frames=240, max_size=800):
         if i > 0 and index < len(events):
             event = events[index]
             c = event.get("command", {})
-            if c.get("op") == "stroke":
+            if c.get("op") in ("stroke", "mask_stroke"):
                 layer = state.layer(c["layer_id"])
                 saved = layer.image
+                saved_mask = layer.mask
                 layer.image = saved.copy()
                 state._apply(c, (moment - start) / weights[index])
                 frame = state.composite()
                 layer.image = saved
+                layer.mask = saved_mask
         frame = frame.scaled(
             max_size,
             max_size,

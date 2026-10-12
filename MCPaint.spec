@@ -9,7 +9,7 @@ a = Analysis(
     hookspath=[], hooksconfig={}, runtime_hooks=[],
     excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
               'PySide6.QtPdf', 'PySide6.QtQml', 'PySide6.QtQuick',
-              'tkinter', 'matplotlib', 'numpy', 'pytest'],
+              'tkinter', 'matplotlib', 'pytest'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

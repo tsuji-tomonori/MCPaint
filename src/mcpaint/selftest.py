@@ -41,6 +41,23 @@ def run():
         export_timelapse(window.doc, folder / "test.mp4", max_frames=8, max_size=128)
         assert (folder / "test.mp4").stat().st_size > 100
         assert mcp.name == "MCPaint"
+        # Frozen builds must import numpy and expose every extension module, too.
+        window.handle({"op": "add_layer", "kind": "group", "name": "colors"})
+        window.handle({"op": "add_layer", "group_id": window.doc.active_id})
+        window.handle({"op": "select_region", "kind": "ellipse", "rect": [20, 20, 50, 50]})
+        window.handle({"op": "fill", "mode": "selection", "color": "#3388dd"})
+        window.handle(
+            {"op": "update_layer", "changes": {"alpha_lock": True, "blend_mode": "multiply"}}
+        )
+        window.handle({"op": "mask", "action": "from_selection"})
+        window.handle({"op": "selection_edit", "action": "clear"})
+        window.handle({"op": "filter", "settings": {"kind": "hue_saturation", "hue": 20}})
+        extended = folder / "extended.mcpaint"
+        window.doc.save(extended)
+        assert Document.load(extended).composite() == window.doc.composite()
+        import asyncio
+
+        assert len(asyncio.run(mcp.list_tools())) == 33
         window.close()
     print(
         json.dumps(

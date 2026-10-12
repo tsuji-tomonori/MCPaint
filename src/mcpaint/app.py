@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -33,9 +34,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__
+from . import __version__, ui_tools
 from .bridge import Bridge, clone_document, data_dir
-from .engine import BRUSHES, Document, color, draw_stroke, number, png_bytes
+from .engine import BRUSHES, Document, color, number, png_bytes
+from .operations import OPS, drawable, mask_image, pil, qimage, render_layer
 from .timelapse import export_timelapse
 
 BRUSH_NAMES = {
@@ -44,6 +46,10 @@ BRUSH_NAMES = {
     "marker": "マーカー",
     "airbrush": "エアブラシ",
     "eraser": "消しゴム",
+    "watercolor": "水彩",
+    "spray": "飛沫",
+    "blur": "ぼかしブラシ",
+    "smudge": "色混ぜ",
 }
 
 
@@ -61,6 +67,11 @@ class Canvas(QWidget):
         self.zoom = 1.0
         self.pan = QPointF()
         self.pan_anchor = None
+        self.gesture = []
+        self.mesh_points = []
+        self.mesh_handle = None
+        self.flip = False
+        self.rotation = 0.0
 
     def geometry_info(self):
         d = self.window.doc
@@ -76,6 +87,15 @@ class Canvas(QWidget):
         origin, scale = self.geometry_info()
         x, y = (position.x() - origin.x()) / scale, (position.y() - origin.y()) / scale
         d = self.window.doc
+        if self.rotation:
+            angle = math.radians(-self.rotation)
+            ux, uy = x - d.width / 2, y - d.height / 2
+            x, y = (
+                ux * math.cos(angle) - uy * math.sin(angle) + d.width / 2,
+                ux * math.sin(angle) + uy * math.cos(angle) + d.height / 2,
+            )
+        if self.flip:
+            x = d.width - 1 - x
         if clamp:
             return max(0, min(d.width - 1, x)), max(0, min(d.height - 1, y))
         return (x, y) if 0 <= x < d.width and 0 <= y < d.height else None
@@ -93,9 +113,18 @@ class Canvas(QWidget):
         p.fillRect(area.adjusted(4, 4, 4, 4), QColor("#0c111a"))
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         image = self.preview if self.preview is not None else d.composite()
+        p.save()
+        p.translate(area.center())
+        p.rotate(self.rotation)
+        p.translate(-area.center())
+        if self.flip:
+            image = image.mirrored(True, False)
         p.drawImage(area, image)
+        ui_tools.overlay(self, p, area)
         p.setPen(QColor("#8795ac"))
         p.drawRect(area)
+        p.restore()
+        p.setPen(QColor("#8795ac"))
         p.drawText(
             QPointF(origin.x(), max(18, origin.y() - 12)), f"0, 0   ·   {d.width} × {d.height} px"
         )
@@ -113,8 +142,10 @@ class Canvas(QWidget):
         point = self.document_point(position)
         if point is None:
             return
-        if self.window.doc.layer().locked:
-            self.window.statusBar().showMessage("レイヤーはロックされています", 3000)
+        try:
+            drawable(self.window.doc, self.window.doc.layer())
+        except ValueError as e:
+            self.window.statusBar().showMessage(str(e), 3000)
             return
         self.started = time.monotonic()
         self.points = []
@@ -144,7 +175,7 @@ class Canvas(QWidget):
             layer = self.window.doc.layer(self.stroke["layer_id"])
             saved = layer.image
             layer.image = saved.copy()
-            draw_stroke(layer.image, self.stroke)
+            self.window.doc._apply(self.stroke)
             self.preview = self.window.doc.composite()
             layer.image = saved
         self.update()
@@ -159,12 +190,16 @@ class Canvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
+        if ui_tools.press(self, event):
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             self.pan_anchor = event.position()
         elif event.button() == Qt.MouseButton.LeftButton:
             self.begin(event.position())
 
     def mouseMoveEvent(self, event):
+        if ui_tools.move(self, event):
+            return
         if self.pan_anchor is not None:
             self.pan += event.position() - self.pan_anchor
             self.pan_anchor = event.position()
@@ -176,6 +211,8 @@ class Canvas(QWidget):
             self.window.coordinate_label.setText(f"X {point[0]:.0f}   Y {point[1]:.0f}")
 
     def mouseReleaseEvent(self, event):
+        if ui_tools.release(self, event):
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             self.pan_anchor = None
         elif event.button() == Qt.MouseButton.LeftButton:
@@ -207,7 +244,14 @@ class PaintWindow(QMainWindow):
     def __init__(self, start_bridge=True, recover=True):
         super().__init__()
         self.doc = Document()
-        self.brush = {"brush": "pen", "color": "#24334a", "size": 5.0, "opacity": 1.0}
+        self.brush = {
+            "brush": "pen",
+            "color": "#24334a",
+            "size": 5.0,
+            "opacity": 1.0,
+            "smoothing": 0.0,
+        }
+        self.tool = "brush"
         self.project_path = None
         self.autosave_path = data_dir() / "autosave.mcpaint"
         self.export_running = False
@@ -317,6 +361,8 @@ class PaintWindow(QMainWindow):
         )
         panel.addWidget(QLabel("レイヤーの不透明度"))
         panel.addWidget(self.layer_opacity)
+        self.build_menus()
+        ui_tools.install(self, panel)
         section("RECORD / 制作記録")
         self.record_label = QLabel()
         panel.addWidget(self.record_label)
@@ -328,14 +374,19 @@ class PaintWindow(QMainWindow):
         self.connection_label.setStyleSheet("color: #71dcca; font-size: 11px;")
         panel.addWidget(self.connection_label)
         splitter.addWidget(self.canvas)
-        splitter.addWidget(side)
-        splitter.setSizes([1030, 270])
+        sidebar = QScrollArea()
+        sidebar.setWidgetResizable(True)
+        side.setMaximumWidth(10000)
+        sidebar.setMinimumWidth(310)
+        sidebar.setMaximumWidth(350)
+        sidebar.setWidget(side)
+        splitter.addWidget(sidebar)
+        splitter.setSizes([980, 340])
         self.setCentralWidget(splitter)
         self.coordinate_label = QLabel("X —   Y —")
         self.zoom_label = QLabel("表示 100%  ·  ホイールで拡大 / 中ボタンで移動")
         self.statusBar().addWidget(self.coordinate_label)
         self.statusBar().addPermanentWidget(self.zoom_label)
-        self.build_menus()
         self.export_done.connect(self.on_export_done)
         self.bridge = Bridge() if start_bridge else None
         self.timer = QTimer(self)
@@ -372,8 +423,25 @@ class PaintWindow(QMainWindow):
     def refresh(self):
         self.layers_list.blockSignals(True)
         self.layers_list.clear()
-        for layer in reversed(self.doc.layers):
-            item = QListWidgetItem(("🔒 " if layer.locked else "") + layer.name)
+
+        def visible_order(parent=None):
+            items = []
+            for layer in reversed([x for x in self.doc.layers if x.group_id == parent]):
+                items.append(layer)
+                if layer.kind == "group":
+                    items.extend(visible_order(layer.id))
+            return items
+
+        for layer in visible_order():
+            prefix = "📁 " if layer.kind == "group" else "◐ " if layer.kind == "adjustment" else ""
+            depth = 0
+            parent = layer.group_id
+            while parent:
+                depth += 1
+                parent = self.doc.layer(parent).group_id
+            item = QListWidgetItem(
+                "  " * depth + ("🔒 " if layer.locked else "") + prefix + layer.name
+            )
             item.setData(Qt.ItemDataRole.UserRole, layer.id)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
@@ -386,6 +454,7 @@ class PaintWindow(QMainWindow):
         self.lock_check.blockSignals(False)
         self.layer_opacity.setValue(round(self.doc.layer().opacity * 100))
         self.record_label.setText(f"● REC   {len(self.doc.timeline)} 操作を記録")
+        ui_tools.refresh(self)
         self.canvas.update()
 
     def changed(self):
@@ -394,6 +463,12 @@ class PaintWindow(QMainWindow):
 
     def mutate(self, command):
         try:
+            if command.get("op") == "add_layer" and "group_id" not in command:
+                current = self.doc.layer()
+                command = {
+                    **command,
+                    "group_id": current.id if current.kind == "group" else current.group_id,
+                }
             self.doc.execute(command)
             self.changed()
         except Exception as e:
@@ -448,6 +523,7 @@ class PaintWindow(QMainWindow):
     def fit_canvas(self):
         self.canvas.zoom = 1
         self.canvas.pan = QPointF()
+        self.canvas.rotation = 0
         self.zoom_label.setText("表示 100%  ·  ホイールで拡大 / 中ボタンで移動")
         self.canvas.update()
 
@@ -548,7 +624,11 @@ class PaintWindow(QMainWindow):
 
     def handle(self, request):
         op = request["op"]
-        if self.canvas.stroke is not None and op != "screenshot":
+        if (
+            self.canvas.stroke is not None
+            or self.canvas.mesh_handle is not None
+            or self.canvas.gesture
+        ) and op not in ("screenshot", "sample_color"):
             raise ValueError("手で描画中です。ストローク終了後に操作してください")
         if (
             request.get("expected_revision") is not None
@@ -565,6 +645,7 @@ class PaintWindow(QMainWindow):
             self.checkpoint()
             doc.revision = self.doc.revision + 1
             self.doc = doc
+            ui_tools.change_tool(self)
             self.project_path = None
             self.fit_canvas()
             self.changed()
@@ -576,11 +657,13 @@ class PaintWindow(QMainWindow):
             color(candidate["color"])
             number(candidate["size"], 0.5, 300, "size")
             number(candidate["opacity"], 0, 1, "opacity")
+            number(candidate["smoothing"], 0, 1, "smoothing")
             self.brush = candidate
             self.brush_combo.setCurrentIndex(BRUSHES.index(candidate["brush"]))
             self.size_spin.setValue(candidate["size"])
             self.opacity_spin.setValue(round(candidate["opacity"] * 100))
             self.set_color(candidate["color"])
+            self.smoothing_spin.setValue(candidate["smoothing"])
         elif op in (
             "stroke",
             "add_layer",
@@ -606,6 +689,7 @@ class PaintWindow(QMainWindow):
             self.checkpoint()
             doc.revision = self.doc.revision + 1
             self.doc = doc
+            ui_tools.change_tool(self)
             self.project_path = request["path"]
             self.fit_canvas()
             self.changed()
@@ -624,13 +708,34 @@ class PaintWindow(QMainWindow):
                 request.get("max_frames", 240),
                 request.get("max_size", 800),
             )
+        elif op == "sample_color":
+            from .operations import point, reference_image
+
+            position = point(self.doc, request["point"])
+            sampled = reference_image(self.doc, request).pixelColor(
+                int(position[0]), int(position[1])
+            )
+            extra["sample"] = {"color": sampled.name(), "rgba": sampled.getRgb()}
+        elif op == "set_view":
+            if "flip_horizontal" in request:
+                self.canvas.flip = bool(request["flip_horizontal"])
+            if "zoom" in request:
+                self.canvas.zoom = number(request["zoom"], 0.25, 8, "zoom")
+            if "rotation" in request:
+                self.canvas.rotation = number(request["rotation"], -180, 180, "rotation")
+            self.canvas.update()
+        elif op in OPS:
+            if op == "import_image" and "data" not in request:
+                request = {**request, "data": ui_tools.canonical_image(request["path"])}
+            self.doc.execute(request)
+            self.changed()
         elif op != "screenshot":
             raise ValueError("未知の操作です")
         self.connection_label.setText("● MCP 操作を受信 / ローカル専用")
         self.canvas.repaint()
         scope = request.get("scope", "canvas")
-        if scope not in ("canvas", "window"):
-            raise ValueError("scopeはcanvasかwindowです")
+        if scope not in ("canvas", "window", "layer", "selection", "mask"):
+            raise ValueError("scopeはcanvas/window/layer/selection/maskです")
         image = (
             self.grab().toImage()
             if scope == "window"
@@ -638,6 +743,27 @@ class PaintWindow(QMainWindow):
             if self.canvas.preview is not None
             else self.doc.composite()
         )
+        if scope == "layer":
+            image = render_layer(self.doc, self.doc.layer(request.get("layer_id")))
+        elif scope in ("selection", "mask"):
+            from .operations import solid_mask
+
+            mask = (
+                self.doc.selection
+                if scope == "selection"
+                else self.doc.layer(request.get("layer_id")).mask
+            )
+            image = mask_image(mask if mask is not None else solid_mask(self.doc, 0))
+        elif (
+            scope == "canvas"
+            and request.get("selection_overlay", True)
+            and self.doc.selection is not None
+        ):
+            from PIL import Image
+
+            tint = Image.new("RGBA", (self.doc.width, self.doc.height), (50, 140, 230, 0))
+            tint.putalpha(self.doc.selection.point(lambda v: round(v * 0.15)))
+            image = qimage(Image.alpha_composite(pil(image), tint))
         origin = [0, 0]
         crop = request.get("crop")
         if crop:
@@ -670,6 +796,11 @@ class PaintWindow(QMainWindow):
         return {
             "state": self.doc.state(),
             "brush": self.brush,
+            "view": {
+                "zoom": self.canvas.zoom,
+                "flip_horizontal": self.canvas.flip,
+                "rotation": self.canvas.rotation,
+            },
             **extra,
             "image": base64.b64encode(png_bytes(image)).decode(),
             "image_info": {
